@@ -1,0 +1,13 @@
+# build artefacts
+*__pycache__/
+*.pyc
+# virtualenv
+*.venv/
+# data & outputs
+*outputs/
+data/
+*.csv
+*.png
+# notebooks checkpoints
+*.ipynb_checkpoints
+*.egg-info
