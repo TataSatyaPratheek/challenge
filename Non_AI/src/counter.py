@@ -20,14 +20,20 @@ Pure-OpenCV; no other dependencies.
 from __future__ import annotations
 
 import csv
+import numpy as np
 import logging
 import pathlib
 from typing import Optional
 
 import cv2
 
-from .classify_mask import classify_objects, create_colored_mask
-from .config import CSV_DIR, MASK_DIR, MAX_REASONABLE_COUNT
+from .classify_mask import classify_objects
+from .config import CSV_DIR, MASK_DIR, MAX_REASONABLE_COUNT, OUT_DIR
+from .mask_utils import (
+    create_coloured_mask,
+    create_coloured_overlay,
+    labels_to_binary,
+)
 from .segmentation import split_instances
 
 log = logging.getLogger(__name__)
@@ -61,13 +67,21 @@ def process_image(image_path: str | pathlib.Path) -> Optional[int]:
     stem = path.stem
     log.info("Processing image: %s", path.name)
 
-    img = cv2.imread(str(path))
-    if img is None:
+    raw_img = cv2.imread(str(path)) # Renamed for clarity, distinguishing from processed versions
+    if raw_img is None:
         log.error("OpenCV failed to read image: %s", path)
         return None
 
+    # Abort on extreme exposure conditions before more complex processing.
+    # Note: raw_img.mean() calculates mean across all color channels if present.
+    # For a more direct brightness measure, conversion to grayscale first could be considered.
+    mean_intensity = raw_img.mean()
+    if mean_intensity < 30 or mean_intensity > 230: # Range [0, 255]
+        log.error("Frame exposure (mean intensity: %.1f) out of safe range [30, 230] – skipped", mean_intensity)
+        return None
+
     # --- segmentation & classification ---------------------------------- #
-    markers = split_instances(img)
+    markers = split_instances(raw_img) # Pass the original (raw) image
     objects = classify_objects(markers)
     total = len(objects)
     log.info("Detected %d objects in %s", total, path.name)
@@ -81,15 +95,34 @@ def process_image(image_path: str | pathlib.Path) -> Optional[int]:
         )
         return None
 
-    # --- write artefacts ------------------------------------------------- #
-    mask_rgb = create_colored_mask(objects, img.shape)
-    mask_file = MASK_DIR / f"{stem}_mask.png"
-    csv_file = CSV_DIR / f"{stem}.csv"
-    txt_file = MASK_DIR / f"{stem}_count.txt"
+    # --- Reconstruct a final marker image from accepted objects ---
+    final_markers = np.zeros(raw_img.shape[:2], dtype=np.int32)
+    for i, obj in enumerate(objects.values(), 1):
+        final_markers[obj["mask"] > 0] = i
 
+    # --- write artefacts ------------------------------------------------- #
+    # 1. Coloured mask (on black)
+    mask_rgb = create_coloured_mask(objects, raw_img.shape)
+    mask_file = MASK_DIR / f"{stem}_mask.png"
     cv2.imwrite(str(mask_file), mask_rgb)
+
+    # 2. CSV with object properties
+    csv_file = CSV_DIR / f"{stem}.csv"
     _write_csv(csv_file, objects)
+
+    # 3. Text file with just the count
+    txt_file = MASK_DIR / f"{stem}_count.txt"
     txt_file.write_text(f"{total}\n", encoding="utf-8")
 
-    log.debug("Artefacts saved: %s  %s", mask_file.name, csv_file.name)
+    # 4. (New) Visual inspection overlay on original image
+    overlay_img = create_coloured_overlay(raw_img, final_markers, alpha=0.5)
+    overlay_file = OUT_DIR / f"{stem}_overlay.png"
+    cv2.imwrite(str(overlay_file), overlay_img)
+
+    # 5. (New) Simple binary mask of all accepted objects
+    binary_mask = labels_to_binary(final_markers)
+    binary_mask_file = MASK_DIR / f"{stem}_binary.png"
+    cv2.imwrite(str(binary_mask_file), binary_mask)
+
+    log.debug("Artefacts saved for %s", stem)
     return total

@@ -24,6 +24,7 @@ from typing import Dict
 import cv2
 import numpy as np
 
+from .mask_utils import smooth_mask
 from .config import (
     get_adaptive_parameters,
     MIN_CIRC_HQ,
@@ -31,6 +32,8 @@ from .config import (
     HOLE_RATIO_LOW,
     HOLE_RATIO_HIGH,
     HEX_VERT_TOL,
+    BOLT_ASPECT_MIN,
+    BOLT_MIN_AREA_FACTOR,
 )
 
 log = logging.getLogger(__name__)
@@ -47,24 +50,29 @@ def _get_adaptive_area_bounds(
     of the first-pass markers.  Robust against ragged masks and outliers.
     """
     areas: list[float] = []
-
     for label in np.unique(markers):
         if label == 0:  # background
             continue
 
         mask = np.uint8(markers == label)
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if not contours:
-            continue
+        cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if cnts:
+            areas.append(cv2.contourArea(max(cnts, key=cv2.contourArea)))
 
-        areas.append(cv2.contourArea(max(contours, key=cv2.contourArea)))
-
-    if len(areas) < 5:  # insufficient statistics
+    # use middle 60 % to kill extreme outliers
+    if len(areas) < 5:
         return base_min_area, base_max_area
 
-    median_area = float(np.median(areas))
-    dyn_min = int(max(base_min_area * 0.5, median_area * 0.20))
-    dyn_max = int(min(base_max_area * 1.5, median_area * 8.0))
+    areas.sort()
+    k = int(len(areas) * 0.2)
+    # Only trim if we have enough data points
+    core = areas[k:-k] if len(areas) > 10 else areas
+    if not core: # handle case where trimming results in empty list
+        return base_min_area, base_max_area
+    median_area = float(np.median(core))
+
+    dyn_min = int(max(base_min_area * 0.5, median_area * 0.30))
+    dyn_max = int(min(base_max_area * 2.0, median_area * 5.0))
 
     log.debug(
         "Adaptive area bounds: median=%.1f  →  [%d,%d] (base [%d,%d])",
@@ -134,7 +142,16 @@ def classify_objects(markers: np.ndarray) -> Dict[int, dict]:
         if label == 0:
             continue
 
+        # Create mask for the current label
         mask = np.uint8(markers == label)
+
+        # A rough pixel count to decide on smoothing. This is faster than finding
+        # contours first. We apply light smoothing only to smaller objects, which
+        # are more likely to be fragmented.
+        pixel_count = np.count_nonzero(mask)
+        if 0 < pixel_count < 500:
+            mask = smooth_mask(mask, close_kernel=(3, 3), blur_ksize=0, iterations=1)
+
         contours, hierarchy = cv2.findContours(
             mask, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE
         )
@@ -161,6 +178,9 @@ def classify_objects(markers: np.ndarray) -> Dict[int, dict]:
             child_idx = hierarchy[0][idx][2] # Index of the first child contour
             inner_area = cv2.contourArea(contours[child_idx])
 
+        # DEBUG: Log circularity values to diagnose filter issues
+        log.debug(f"Object {label}: area={area:.1f}, circ={circularity:.3f}, hole={has_hole}")
+
         # --------------- circularity gate -----------------
         # If the object has no hole, it must pass the circularity filter to be considered.
         # If it has a hole, this check is bypassed, as hole features will determine its type.
@@ -173,19 +193,38 @@ def classify_objects(markers: np.ndarray) -> Dict[int, dict]:
         # --------------- additional shape cues ------------
         # Approximate the contour to a polygon to check for hex-like shapes (nuts)
         approx = cv2.approxPolyDP(contour, 0.04 * peri, True)
-        hex_score = abs(len(approx) - 6)  # Lower score is more hex-like (0 or 1 for HEX_VERT_TOL=1)
-        
-        # Calculate the ratio of outer area to inner (hole) area
-        ratio = area / inner_area if (has_hole and inner_area > 1) else 0.0
+        verts = len(approx)
+        if 5 <= verts <= 7:
+            # approx[i] is [[x,y]], so approx[i][0] is [x,y] for linalg.norm
+            points = [pt[0] for pt in approx] 
+            edges = [np.linalg.norm(points[i] - points[(i + 1) % verts])
+                     for i in range(verts)]
+            mean_edges = np.mean(edges)
+            # Coefficient of variation for edge lengths. Lower is more regular.
+            # Add small epsilon to prevent division by zero for very small/degenerate polygons.
+            hex_score = np.std(edges) / (mean_edges + 1e-6) if mean_edges > 1e-9 else 1.0
+        else:
+            hex_score = 1.0 # Not 5-7 vertices, high score (less nut-like)
+
+        # Calculate the ratio of inner (hole) area to outer area
+        ratio = inner_area / area if (has_hole and area > 0) else 0.0
 
         # --------------- final type decision --------------
-        if not has_hole:
-            obj_type = "screw"  # Objects without holes are screws
-        else:  # Object has a hole
-            if hex_score <= HEX_VERT_TOL and HOLE_RATIO_LOW <= ratio <= HOLE_RATIO_HIGH:
-                obj_type = "nut"   # Hex-like shape with a specific hole area ratio
+        if has_hole:
+            # Nut: has hole, regular polygon, correct hole ratio
+            if hex_score < 0.15 and HOLE_RATIO_LOW <= ratio <= HOLE_RATIO_HIGH:
+                obj_type = "nut"
             else:
-                obj_type = "bolt"  # Other objects with holes (e.g., traditional washers, actual bolts)
+                obj_type = "bolt"
+        else:
+            # --------------- bolt detector for hole-less elongated parts ----------
+            rect = cv2.minAreaRect(contour)
+            w, h = rect[1]
+            aspect = max(w, h) / (min(w, h) + 1e-6)
+            if aspect > BOLT_ASPECT_MIN and area > min_area * BOLT_MIN_AREA_FACTOR:
+                obj_type = "bolt"
+            else:
+                obj_type = "screw"
 
         results[obj_id] = {
             "type": obj_type,
@@ -197,21 +236,3 @@ def classify_objects(markers: np.ndarray) -> Dict[int, dict]:
 
     log.info("Classification kept %d objects.", len(results))
     return results
-
-
-# --------------------------------------------------------------------------- #
-# colour overlay for visual debug
-# --------------------------------------------------------------------------- #
-def create_colored_mask(classified_objects: dict, img_shape: tuple) -> np.ndarray:
-    """Render each accepted object in a unique colour (HSV-golden-ratio palette)."""
-    canvas = np.zeros((*img_shape[:2], 3), dtype=np.uint8)
-    if not classified_objects:
-        return canvas
-
-    for i, (_, obj) in enumerate(classified_objects.items()):
-        hue = int((i * 137) % 180)  # golden-ratio trick in HSV space
-        hsv = np.uint8([[[hue, 255, 255]]])
-        bgr = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)[0, 0]
-        canvas[obj["mask"] > 0] = bgr.astype(np.uint8)
-
-    return canvas

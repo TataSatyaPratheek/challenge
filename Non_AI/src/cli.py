@@ -5,6 +5,7 @@ import time
 import json
 import logging
 from .counter import process_image
+from .eval_counts import run_evaluation
 from .config import LOG_DIR
 
 log = logging.getLogger(__name__)
@@ -55,6 +56,13 @@ def main():
         log.info("Summary: %d images, %d objects total, %.1fs elapsed", 
                 len(results), total_objects, elapsed)
         log.info("Summary saved to: %s", summary_path)
+
+        # --- auto-evaluation if a GT file is present ----
+        gt_dir = input_path if input_path.is_dir() else input_path.parent
+        gt_json_path = gt_dir / "ground_truth.json"
+        if gt_json_path.exists():
+            log.info("Found ground_truth.json – running evaluation.")
+            run_evaluation(gt_path=gt_json_path, pred_path=summary_path)
 
 if __name__ == "__main__":
     main()
