@@ -10,5 +10,7 @@ setup(
         "numpy",
         "scikit-image",
         "imutils",
+        "scikit-learn",
+        "scipy"
     ],  # Add your project's dependencies
 )

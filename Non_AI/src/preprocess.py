@@ -2,16 +2,26 @@ from __future__ import annotations
 
 import cv2
 import numpy as np
-
-from .config import AUTO_CANNY_HIGH, AUTO_CANNY_LOW, CLAHE_CLIP
+from .config import (
+    PREPROC_DARK_THRESH,
+    PREPROC_BRIGHTEN_ALPHA,
+    PREPROC_BRIGHTEN_BETA,
+    PREPROC_BLUR_KERNEL_SIZE,
+    PREPROC_BLUR_SIGMA,
+    PREPROC_CANNY_LOW,
+    PREPROC_CANNY_HIGH,
+)
 
 
 def stabilise(
     img: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    Apply colour balancing and adaptive Canny edge detection.
+    Apply minimal preprocessing to stabilise the image for segmentation.
 
+    The goal is to preserve object boundaries at all costs. This involves a
+    conditional brightness boost for very dark images, a minimal blur to
+    suppress noise for Canny, and conservative Canny thresholds.
     Args:
         img: Input BGR image as a NumPy array.
 
@@ -21,29 +31,21 @@ def stabilise(
             - gray_img: Grayscale version of the stabilised image.
             - edges_img: Canny edges detected from the grayscale image.
     """
-    # Colour balancing using CLAHE in LAB space
-    lab_img = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
-    l_channel, a_channel, b_channel = cv2.split(lab_img)
+    # 1. Convert to grayscale and conditionally correct for severe darkness
+    gray_img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    if gray_img.mean() < PREPROC_DARK_THRESH:
+        # Boost contrast (alpha) and brightness (beta)
+        gray_img = cv2.convertScaleAbs(
+            gray_img, alpha=PREPROC_BRIGHTEN_ALPHA, beta=PREPROC_BRIGHTEN_BETA
+        )
+    # Create a 3-channel version for consumers that expect a BGR image
+    stabilised_bgr_img = cv2.cvtColor(gray_img, cv2.COLOR_GRAY2BGR)
 
-    clahe = cv2.createCLAHE(clipLimit=CLAHE_CLIP, tileGridSize=(8, 8))
-    l_channel_eq = clahe.apply(l_channel)
+    # 2. Apply a minimal blur to reduce noise for edge detection
+    ksize = (PREPROC_BLUR_KERNEL_SIZE, PREPROC_BLUR_KERNEL_SIZE)
+    blurred_img = cv2.GaussianBlur(gray_img, ksize, PREPROC_BLUR_SIGMA)
 
-    stabilised_bgr_img = cv2.cvtColor(
-        cv2.merge([l_channel_eq, a_channel, b_channel]), cv2.COLOR_LAB2BGR
-    )
-
-    # Convert to grayscale and blur
-    gray_img = cv2.cvtColor(stabilised_bgr_img, cv2.COLOR_BGR2GRAY)
-    # Consider making GaussianBlur kernel size (7,7) and sigma (1.5) configurable
-    blurred_img = cv2.GaussianBlur(gray_img, (7, 7), 1.5)
-
-    # Auto-tune Canny thresholds for dark frames
-    canny_low_thresh, canny_high_thresh = AUTO_CANNY_LOW, AUTO_CANNY_HIGH
-    # Consider making the mean intensity threshold (60) configurable
-    if gray_img.mean() < 60:
-        canny_low_thresh //= 2
-        canny_high_thresh //= 2
-
-    edges_img = cv2.Canny(blurred_img, canny_low_thresh, canny_high_thresh)
+    # 3. Apply Canny edge detection with conservative, fixed thresholds
+    edges_img = cv2.Canny(blurred_img, PREPROC_CANNY_LOW, PREPROC_CANNY_HIGH)
 
     return stabilised_bgr_img, gray_img, edges_img

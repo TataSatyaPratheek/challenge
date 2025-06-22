@@ -59,20 +59,14 @@ def _get_adaptive_area_bounds(
         if cnts:
             areas.append(cv2.contourArea(max(cnts, key=cv2.contourArea)))
 
-    # use middle 60 % to kill extreme outliers
-    if len(areas) < 5:
-        return base_min_area, base_max_area
+    # ULTRA-PERMISSIVE bounds - prioritize recall over precision
+    if len(areas) < 3:
+        return base_min_area, base_max_area * 10
 
-    areas.sort()
-    k = int(len(areas) * 0.2)
-    # Only trim if we have enough data points
-    core = areas[k:-k] if len(areas) > 10 else areas
-    if not core: # handle case where trimming results in empty list
-        return base_min_area, base_max_area
-    median_area = float(np.median(core))
-
-    dyn_min = int(max(base_min_area * 0.5, median_area * 0.30))
-    dyn_max = int(min(base_max_area * 2.0, median_area * 5.0))
+    median_area = float(np.median(areas))
+    # Extremely wide bounds to stop losing real objects
+    dyn_min = int(max(base_min_area * 0.1, median_area * 0.05))
+    dyn_max = int(min(base_max_area * 20.0, median_area * 50.0))
 
     log.debug(
         "Adaptive area bounds: median=%.1f  →  [%d,%d] (base [%d,%d])",
@@ -194,7 +188,7 @@ def classify_objects(markers: np.ndarray) -> Dict[int, dict]:
         # Approximate the contour to a polygon to check for hex-like shapes (nuts)
         approx = cv2.approxPolyDP(contour, 0.04 * peri, True)
         verts = len(approx)
-        if 5 <= verts <= 7:
+        if (6 - HEX_VERT_TOL) <= verts <= (6 + HEX_VERT_TOL):
             # approx[i] is [[x,y]], so approx[i][0] is [x,y] for linalg.norm
             points = [pt[0] for pt in approx] 
             edges = [np.linalg.norm(points[i] - points[(i + 1) % verts])
