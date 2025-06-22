@@ -8,11 +8,8 @@ segmentation.py) into a dictionary of accepted objects. Key changes include:
 1.  Adaptive area bounds now rely on true `cv2.contourArea`, never the rough
     pixel sum that exaggerates ragged masks.
 2.  Enhanced classification: distinguishes between "screw", "nut", and "bolt"
-    based on hole presence, inner/outer area ratios, and polygonal shape
-    approximation (for nuts). Replaces the previous "washer" vs "screw" logic.
-3.  Optional guard-rail: if segmentation has exploded into > 3000 labels the
-    function bails out early (prevents runaway memory in counter.py).
-
+    (placeholder logic). The main filtering is now based on adaptive area
+    thresholds calculated from the image's object size distribution.
 Pure-OpenCV, no external ML.
 """
 
@@ -24,59 +21,8 @@ from typing import Dict
 import cv2
 import numpy as np
 
-from .mask_utils import smooth_mask
-from .config import (
-    get_adaptive_parameters,
-    MIN_CIRC_HQ,
-    MAX_CIRC_HQ,
-    HOLE_RATIO_LOW,
-    HOLE_RATIO_HIGH,
-    HEX_VERT_TOL,
-    BOLT_ASPECT_MIN,
-    BOLT_MIN_AREA_FACTOR,
-)
-
+from . import config
 log = logging.getLogger(__name__)
-
-
-# --------------------------------------------------------------------------- #
-# adaptive area ladder
-# --------------------------------------------------------------------------- #
-def _get_adaptive_area_bounds(
-    markers: np.ndarray, base_min_area: int, base_max_area: int
-) -> tuple[int, int]:
-    """
-    Derive dynamic [min,max] area thresholds from the *true* contour areas
-    of the first-pass markers.  Robust against ragged masks and outliers.
-    """
-    areas: list[float] = []
-    for label in np.unique(markers):
-        if label == 0:  # background
-            continue
-
-        mask = np.uint8(markers == label)
-        cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if cnts:
-            areas.append(cv2.contourArea(max(cnts, key=cv2.contourArea)))
-
-    # ULTRA-PERMISSIVE bounds - prioritize recall over precision
-    if len(areas) < 3:
-        return base_min_area, base_max_area * 10
-
-    median_area = float(np.median(areas))
-    # Extremely wide bounds to stop losing real objects
-    dyn_min = int(max(base_min_area * 0.1, median_area * 0.05))
-    dyn_max = int(min(base_max_area * 20.0, median_area * 50.0))
-
-    log.debug(
-        "Adaptive area bounds: median=%.1f  →  [%d,%d] (base [%d,%d])",
-        median_area,
-        dyn_min,
-        dyn_max,
-        base_min_area,
-        base_max_area,
-    )
-    return dyn_min, dyn_max
 
 
 # --------------------------------------------------------------------------- #
@@ -84,149 +30,73 @@ def _get_adaptive_area_bounds(
 # --------------------------------------------------------------------------- #
 def classify_objects(markers: np.ndarray) -> Dict[int, dict]:
     """
-    Inspect every label in *markers*, apply adaptive area & circularity gates,
-    decide washer vs screw.  Returns:
+    Filters segmented objects based on fixed area bounds.
 
-        { obj_id (int) :
-            {
-              "type"       : "screw" | "nut" | "bolt", # Reflects new classification types
-              "mask"       : np.uint8 (1-ch binary mask),
-              "area"       : float,
-              "circularity": float
-            }, ...
-        }
+    This function validates objects from a raw marker map against fixed area
+    thresholds from the configuration to remove noise and invalid detections.
     """
-    results: Dict[int, dict] = {}
-
     if markers is None or markers.size == 0 or np.max(markers) == 0:
-        return results
+        return {}
 
-    params = get_adaptive_parameters(markers.shape)
-    base_min_area, base_max_area = params["base_min_area"], params["base_max_area"]
+    unique_labels = np.unique(markers)
 
-    # dynamic circularity range --------------------------------------------------
-    if params["pipeline"] == "high_quality_detection":
-        # For HQ, params["min_circularity"] from get_adaptive_parameters is MIN_CIRC_HQ.
-        min_circularity_filter = MIN_CIRC_HQ # Reverted: max(params["min_circularity"], MIN_CIRC_HQ) is redundant
-        max_circularity_filter = MAX_CIRC_HQ
-    else:  # small-object pipeline
-        min_circularity_filter = params["min_circularity"]
-        max_circularity_filter = 1.0  # Default upper bound for non-HQ
+    # Emergency brake for massive object counts to prevent memory/performance issues.
+    if len(unique_labels) > config.CLASSIFY_HARD_LIMIT_OBJECTS:
+        log.error(f"Too many objects ({len(unique_labels)}) - likely segmentation explosion. Aborting classification.")
+        return {}
 
-    # Bail-out guard-rail
-    if np.unique(markers).size - 1 > 3000:
-        log.error(">3000 marker labels – likely fallback explosion – aborting classification.")
-        return results
-
-    # Compute dynamic area ladder
-    min_area, max_area = _get_adaptive_area_bounds(markers, base_min_area, base_max_area)
-
-    log.info(
-        "Classify: pipeline=%s area=[%d,%d] circ_filter=[%.2f, %.2f]",
-        params["pipeline"],
-        min_area,
-        max_area,
-        min_circularity_filter,
-        max_circularity_filter,
-    )
-    # Consider adding HOLE_RATIO_LOW, HOLE_RATIO_HIGH, HEX_VERT_TOL to this log if verbose debug is needed.
-
-    obj_id = 1
-    for label in np.unique(markers):
-        if label == 0:
-            continue
-
-        # Create mask for the current label
+    # 1. Extract all potential objects and their properties in a single pass
+    potential_objects = []
+    all_areas = []
+    for label in unique_labels[unique_labels != 0]:
         mask = np.uint8(markers == label)
-
-        # A rough pixel count to decide on smoothing. This is faster than finding
-        # contours first. We apply light smoothing only to smaller objects, which
-        # are more likely to be fragmented.
-        pixel_count = np.count_nonzero(mask)
-        if 0 < pixel_count < 500:
-            mask = smooth_mask(mask, close_kernel=(3, 3), blur_ksize=0, iterations=1)
-
-        contours, hierarchy = cv2.findContours(
-            mask, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE
+        contours, _ = cv2.findContours(
+            mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
         )
         if not contours:
             continue
 
-        # parent contour
-        idx = np.argmax([cv2.contourArea(c) for c in contours])
-        contour = contours[idx]
+        # Calculate properties for the largest contour found for this label
+        contour = max(contours, key=cv2.contourArea)
         area = cv2.contourArea(contour)
+        perimeter = cv2.arcLength(contour, True)
+        circularity = (4 * np.pi * area) / (perimeter**2) if perimeter > 0 else 0
 
-        if area < min_area or area > max_area:
-            continue
+        potential_objects.append(
+            {"mask": mask, "area": area, "label": label, "circularity": circularity}
+        )
+        all_areas.append(area)
 
-        peri = cv2.arcLength(contour, True)
-        if peri == 0:
-            continue
-        circularity = 4 * np.pi * area / (peri * peri + 1e-6)
+    if not potential_objects:
+        return {}
 
-        # --------------- hole & inner-area -----------------
-        has_hole, inner_area = False, 0.0
-        if hierarchy is not None and hierarchy[0][idx][2] != -1: # Check for a child contour (a hole)
-            has_hole = True
-            child_idx = hierarchy[0][idx][2] # Index of the first child contour
-            inner_area = cv2.contourArea(contours[child_idx])
+    # 2. Apply fixed area bounds for filtering.
+    # As per new configuration, always use fixed bounds, dynamic percentiles are deprecated.
+    min_area = config.FIXED_MIN_OBJECT_AREA
+    max_area = config.FIXED_MAX_OBJECT_AREA
+    log.info(
+        f"Using fixed size bounds [{min_area:.0f}, {max_area:.0f}] for classification. "
+        f"({len(all_areas)} potential objects before filtering)"
+    )
 
-        # DEBUG: Log circularity values to diagnose filter issues
-        log.debug(f"Object {label}: area={area:.1f}, circ={circularity:.3f}, hole={has_hole}")
-
-        # --------------- circularity gate -----------------
-        # If the object has no hole, it must pass the circularity filter to be considered.
-        # If it has a hole, this check is bypassed, as hole features will determine its type.
-        if (
-            not has_hole
-            and not (min_circularity_filter <= circularity <= max_circularity_filter)
-        ):
-            continue
-
-        # --------------- additional shape cues ------------
-        # Approximate the contour to a polygon to check for hex-like shapes (nuts)
-        approx = cv2.approxPolyDP(contour, 0.04 * peri, True)
-        verts = len(approx)
-        if (6 - HEX_VERT_TOL) <= verts <= (6 + HEX_VERT_TOL):
-            # approx[i] is [[x,y]], so approx[i][0] is [x,y] for linalg.norm
-            points = [pt[0] for pt in approx] 
-            edges = [np.linalg.norm(points[i] - points[(i + 1) % verts])
-                     for i in range(verts)]
-            mean_edges = np.mean(edges)
-            # Coefficient of variation for edge lengths. Lower is more regular.
-            # Add small epsilon to prevent division by zero for very small/degenerate polygons.
-            hex_score = np.std(edges) / (mean_edges + 1e-6) if mean_edges > 1e-9 else 1.0
+    # 3. Filter objects and build the final dictionary
+    results: Dict[int, dict] = {}
+    obj_id = 1
+    for obj in potential_objects:
+        if min_area <= obj["area"] <= max_area:
+            results[obj_id] = {
+                "type": "object",
+                "mask": obj["mask"],
+                "area": obj["area"],
+                "circularity": obj["circularity"],
+            }
+            obj_id += 1
         else:
-            hex_score = 1.0 # Not 5-7 vertices, high score (less nut-like)
+            log.debug(
+                f"Object with label {obj['label']} rejected: area={obj['area']:.0f} outside [{min_area:.0f}, {max_area:.0f}]"
+            )
 
-        # Calculate the ratio of inner (hole) area to outer area
-        ratio = inner_area / area if (has_hole and area > 0) else 0.0
-
-        # --------------- final type decision --------------
-        if has_hole:
-            # Nut: has hole, regular polygon, correct hole ratio
-            if hex_score < 0.15 and HOLE_RATIO_LOW <= ratio <= HOLE_RATIO_HIGH:
-                obj_type = "nut"
-            else:
-                obj_type = "bolt"
-        else:
-            # --------------- bolt detector for hole-less elongated parts ----------
-            rect = cv2.minAreaRect(contour)
-            w, h = rect[1]
-            aspect = max(w, h) / (min(w, h) + 1e-6)
-            if aspect > BOLT_ASPECT_MIN and area > min_area * BOLT_MIN_AREA_FACTOR:
-                obj_type = "bolt"
-            else:
-                obj_type = "screw"
-
-        results[obj_id] = {
-            "type": obj_type,
-            "mask": mask,
-            "area": area,
-            "circularity": circularity,
-        }
-        obj_id += 1
-
-    log.info("Classification kept %d objects.", len(results))
+    log.info(
+        "Classification kept %d of %d objects.", len(results), len(potential_objects)
+    )
     return results

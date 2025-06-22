@@ -1,25 +1,31 @@
 # Object Counter and Classifier
 
-This project processes images to detect, count, and classify objects, specifically distinguishing between "washers" and "screws" based on their geometric properties.
+This project processes images to detect, count, and classify objects like screws, nuts, and bolts. It features an adaptive pipeline that can handle images with high object density by automatically switching to a tiling-based approach for robust segmentation.
 
 ## Overview
 
 The system takes an input image (or a directory of images), performs preprocessing, segments individual objects, classifies each object, and then outputs the results in various formats including a summary log, individual CSV files for each image, and visual mask images.
 
 Key processing steps include:
-1.  **Preprocessing**: Converts the image to grayscale, applies Gaussian blur, and then binarizes it using Otsu's thresholding.
-2.  **Segmentation**: Uses Distance Transform and Watershed algorithm to separate touching or overlapping objects.
-3.  **Classification**: Identifies objects as "washer" or "screw" based on contour circularity and the presence of holes.
+1.  **Image Analysis**: The system first performs a quick check on image properties like brightness and object density.
+2.  **Adaptive Segmentation**:
+    - For images with low-to-moderate object density, it uses a direct contour detection method on the entire image.
+    - For images with high object density (e.g., many small parts), it automatically switches to a **tiling strategy**. The image is split into overlapping tiles, each is processed independently, and the results are intelligently stitched back together. This prevents performance issues and improves accuracy in crowded scenes.
+3.  **Classification**: After segmentation, each potential object is validated based on its area. The current implementation performs a general "object" classification, with infrastructure in place for more specific types (nuts, bolts, etc.).
 
 ## Features
 
 - Process single JPG images or all JPG images within a specified directory.
-- Classify detected objects into "washer" or "screw".
-- Generate individual CSV reports for each processed image, detailing each object's ID, class, and pixel count.
-- Save colored mask images for visual inspection of detected and classified objects.
+- **Adaptive Tiling**: Automatically handles dense images to ensure robust performance.
+- Generate individual CSV reports for each processed image, detailing each object's ID, type, area, and circularity.
+- Save multiple visual artifacts for inspection:
+    - Colored masks on a black background.
+    - Colored overlays on the original image.
+    - Simple binary masks.
 - Produce a JSON summary log for each run, detailing the number of objects found in each image.
 - Configurable processing parameters via `config.py`.
 - Detailed logging for both Python and OpenCV operations.
+- Built-in evaluation script to compare results against a ground truth file.
 
 ## Project Structure
 
@@ -27,10 +33,12 @@ The main components are:
 
 - `cli.py`: Command-line interface for running the image processing pipeline.
 - `counter.py`: Orchestrates the image processing steps for a single image.
-- `preprocess.py`: Handles image binarization.
 - `segmentation.py`: Implements object instance segmentation.
+- `preprocess.py`: Contains functions for image preparation like thresholding.
+- `tiling.py`: Provides the core functions for creating, processing, and stitching image tiles.
 - `classify_mask.py`: Classifies segmented objects and generates colored masks.
 - `config.py`: Contains configuration parameters for paths, preprocessing, segmentation, classification, and logging.
+- `eval_counts.py`: Compares pipeline output to a ground-truth JSON file.
 
 **Output Directories (created automatically relative to the project root, one level above `src`):**
 
@@ -120,22 +128,18 @@ Console output will also provide information on the processing steps, errors, an
 
 1.  **Image Loading**: The input image is loaded.
 2.  **Preprocessing (`preprocess.py`)**:
-    - The image is converted to grayscale.
-    - Gaussian blur is applied to reduce noise.
-    - Otsu's thresholding is used to create a binary mask.
-3.  **Segmentation (`segmentation.py`)**:
-    - The binary mask undergoes a distance transform.
-    - The distance map is thresholded to find "sure foreground" regions.
-    - The Watershed algorithm is applied to segment individual object instances.
-4.  **Classification & Tagging (`classify_mask.py`)**:
-    - For each segmented instance:
-        - Contour area and perimeter are calculated.
-        - Circularity is computed.
-        - The presence of holes is checked.
-        - Based on `MIN_AREA`, circularity (`WASHER_CIRCULARITY_THRESHOLD`), and hole presence, the object is classified as "washer" or "screw".
-        - A dictionary of classified instances and their masks is created.
-5.  **Output Generation (`counter.py`, `classify_mask.py`)**:
-    - A colored mask image is generated where each instance has a unique color.
+3.  **Segmentation (`segmentation.py` & `tiling.py`)**:
+    - The system estimates object density to decide whether to use the standard or tiled approach.
+    - **Standard Path**: The image is converted to grayscale, and contours are detected to create an initial marker map.
+    - **Tiled Path**: The image is divided into overlapping tiles. Contour detection is run on each tile. The resulting markers are stitched into a full-size map, and object fragments across tile boundaries are merged.
+4.  **Classification (`classify_mask.py`)**:
+    - The raw markers from segmentation are processed.
+    - Contours are extracted for each potential object to get an accurate area.
+    - An adaptive area filter is applied, removing objects that are too small or too large relative to the main distribution of object sizes in the image.
+    - A dictionary of accepted objects and their properties is created.
+5.  **Output Generation (`counter.py`, `mask_utils.py`)**:
+    - A final marker map is reconstructed from the accepted objects.
+    - Various artifacts are saved: a colored mask, a colored overlay on the original image, a binary mask, and a text file with the final count.
     - A CSV file is written with details for each instance.
     - The total count of instances for the image is returned.
 6.  **Reporting (`cli.py`)**:

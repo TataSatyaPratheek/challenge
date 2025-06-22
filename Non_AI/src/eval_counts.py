@@ -13,7 +13,7 @@ from __future__ import annotations
 import argparse, json, re, logging, pathlib, statistics, sys
 from typing import Dict
 
-from .config import LOG_DIR
+from .config import LOG_DIR, SUMMARY_FILENAME_PREFIX
 
 log = logging.getLogger(__name__)
 
@@ -37,7 +37,7 @@ def _load_json(p: pathlib.Path) -> Dict[str, int] | None:
         return None
 
 def _latest_summary() -> pathlib.Path | None:
-    summaries = sorted(LOG_DIR.glob("summary_*.json"))
+    summaries = sorted(LOG_DIR.glob(f"{SUMMARY_FILENAME_PREFIX}*.json"))
     return summaries[-1] if summaries else None
 
 # --------------------------------------------------------------------------- #

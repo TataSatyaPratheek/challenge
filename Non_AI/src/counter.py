@@ -28,7 +28,9 @@ from typing import Optional
 import cv2
 
 from .classify_mask import classify_objects
-from .config import CSV_DIR, MASK_DIR, MAX_REASONABLE_COUNT, OUT_DIR
+from .config import (
+    CSV_DIR, MASK_DIR, MAX_REASONABLE_COUNT, MAX_MEAN_INTENSITY, MIN_MEAN_INTENSITY, OUT_DIR
+)
 from .mask_utils import (
     create_coloured_mask,
     create_coloured_overlay,
@@ -76,8 +78,13 @@ def process_image(image_path: str | pathlib.Path) -> Optional[int]:
     # Note: raw_img.mean() calculates mean across all color channels if present.
     # For a more direct brightness measure, conversion to grayscale first could be considered.
     mean_intensity = raw_img.mean()
-    if mean_intensity < 30 or mean_intensity > 230: # Range [0, 255]
-        log.error("Frame exposure (mean intensity: %.1f) out of safe range [30, 230] – skipped", mean_intensity)
+    if not (MIN_MEAN_INTENSITY <= mean_intensity <= MAX_MEAN_INTENSITY):
+        log.error(
+            "Frame exposure (mean intensity: %.1f) out of safe range [%d, %d] – skipped",
+            mean_intensity,
+            MIN_MEAN_INTENSITY,
+            MAX_MEAN_INTENSITY,
+        )
         return None
 
     # --- segmentation & classification ---------------------------------- #
@@ -115,7 +122,7 @@ def process_image(image_path: str | pathlib.Path) -> Optional[int]:
     txt_file.write_text(f"{total}\n", encoding="utf-8")
 
     # 4. (New) Visual inspection overlay on original image
-    overlay_img = create_coloured_overlay(raw_img, final_markers, alpha=0.5)
+    overlay_img = create_coloured_overlay(raw_img, final_markers)
     overlay_file = OUT_DIR / f"{stem}_overlay.png"
     cv2.imwrite(str(overlay_file), overlay_img)
 

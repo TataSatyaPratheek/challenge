@@ -10,17 +10,18 @@ from __future__ import annotations
 
 import cv2
 import numpy as np
-from typing import Tuple
+from typing import Dict, Tuple
 
+from . import config
 
 # --------------------------------------------------------------------------- #
 # 1. mask smoothing                                                           
 # --------------------------------------------------------------------------- #
 def smooth_mask(
     binary: np.ndarray,
-    close_kernel: Tuple[int, int] = (3, 3),
-    blur_ksize: int = 5,
-    iterations: int = 2,
+    close_kernel: Tuple[int, int] = config.SMOOTH_MASK_CLOSE_KERNEL,
+    blur_ksize: int = config.SMOOTH_MASK_BLUR_KSIZE,
+    iterations: int = config.SMOOTH_MASK_ITERATIONS,
 ) -> np.ndarray:
     """
     Remove 1-pixel holes and staircase artefacts from a binary mask.
@@ -50,7 +51,7 @@ def smooth_mask(
     if blur_ksize and blur_ksize >= 3:
         closed = cv2.GaussianBlur(closed, (blur_ksize, blur_ksize), 0)
         # Re-binarise because Gaussian introduces grey pixels
-        _, closed = cv2.threshold(closed, 127, 255, cv2.THRESH_BINARY)
+        _, closed = cv2.threshold(closed, config.SMOOTH_MASK_THRESH, 255, cv2.THRESH_BINARY)
 
     return closed
 
@@ -59,7 +60,7 @@ def smooth_mask(
 # 2. coloured overlay                                                          #
 # --------------------------------------------------------------------------- #
 def create_coloured_overlay(
-    bgr: np.ndarray, markers: np.ndarray, alpha: float = 0.45
+    bgr: np.ndarray, markers: np.ndarray, alpha: float = config.OVERLAY_ALPHA
 ) -> np.ndarray:
     """
     Render each non-zero label in `markers` with a distinct pseudo-random colour
@@ -84,9 +85,9 @@ def create_coloured_overlay(
     # Golden-ratio hue stepping ⇒ visually distinct colours
     ids = [lbl for lbl in np.unique(markers) if lbl != 0]
     for i, lbl in enumerate(ids, 1):
-        hue = (i * 137) % 180  # 137° ≈ golden-ratio in HSV space
+        hue = (i * config.HUE_GOLDEN_RATIO_DEGREES) % 180  # 137° ≈ golden-ratio in HSV space
         colour = cv2.cvtColor(
-            np.uint8([[[hue, 200, 255]]]), cv2.COLOR_HSV2BGR
+            np.uint8([[[hue, config.OVERLAY_SATURATION, config.OVERLAY_VALUE]]]), cv2.COLOR_HSV2BGR
         )[0, 0].tolist()
         overlay[markers == lbl] = colour
 
@@ -117,7 +118,7 @@ def labels_to_binary(markers: np.ndarray) -> np.ndarray:
 # 4. coloured mask from classified objects
 # --------------------------------------------------------------------------- #
 def create_coloured_mask(
-    classified_objects: dict, img_shape: tuple
+    classified_objects: Dict, img_shape: tuple
 ) -> np.ndarray:
     """
     Render each accepted object from a dictionary in a unique colour.
@@ -141,8 +142,8 @@ def create_coloured_mask(
         return canvas
 
     for i, obj in enumerate(classified_objects.values()):
-        hue = int((i * 137) % 180)  # golden-ratio palette
-        hsv = np.uint8([[[hue, 255, 255]]])
+        hue = int((i * config.HUE_GOLDEN_RATIO_DEGREES) % 180)  # golden-ratio palette
+        hsv = np.uint8([[[hue, config.MASK_SATURATION, config.MASK_VALUE]]])
         bgr = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)[0, 0]
         canvas[obj["mask"] > 0] = bgr.astype(np.uint8)
 
